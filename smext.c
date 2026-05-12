@@ -1,6 +1,6 @@
 /*
  * smext.c — a minimal terminal text editor
- * Features: open/edit/save, arrow keys, flags below
+ * Features: open/edit/save, arrow keys, mouse scroll, flags below
  * Flags:    --readonly  --backup  --numbers  --wrap=N  --justify
  * Compile:  cc smext.c -o smext
  * Usage:    smext [flags] filename
@@ -78,7 +78,10 @@ static void set_bg(int code) { char b[16]; b[0]='\033';b[1]='[';
 static void reset_attr(void) { ws("\033[0m"); }
 
 /* ─── raw mode ──────────────────────────────────────────────────── */
-static void disable_raw(void) { tcsetattr(0, TCSAFLUSH, &orig_termios); }
+static void disable_raw(void) {
+    tcsetattr(0, TCSAFLUSH, &orig_termios);
+    ws("\033[?1000l\033[?1006l");   /* disable mouse reporting on exit */
+}
 
 static void enable_raw(void) {
     tcgetattr(0, &orig_termios);
@@ -90,6 +93,7 @@ static void enable_raw(void) {
     raw.c_lflag &= ~(unsigned)(ECHO|ICANON|IEXTEN|ISIG);
     raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
     tcsetattr(0, TCSAFLUSH, &raw);
+    ws("\033[?1000h\033[?1006h");   /* enable mouse + SGR extended mode */
 }
 
 /* ─── terminal size ─────────────────────────────────────────────── */
@@ -356,24 +360,51 @@ static void insert_newline(void) {
 }
 
 /* ─── input ─────────────────────────────────────────────────────── */
+#define KEY_UP        1000
+#define KEY_DOWN      1001
+#define KEY_RIGHT     1002
+#define KEY_LEFT      1003
+#define KEY_SCROLL_UP 1004
+#define KEY_SCROLL_DN 1005
+
 static int read_key(void) {
     unsigned char c;
     if (read(0, &c, 1) != 1) return -1;
-    if (c == '\033') {
-        unsigned char seq[3];
-        if (read(0, &seq[0], 1) != 1) return '\033';
-        if (read(0, &seq[1], 1) != 1) return '\033';
-        if (seq[0] == '[') {
-            switch (seq[1]) {
-                case 'A': return 1000; /* up    */
-                case 'B': return 1001; /* down  */
-                case 'C': return 1002; /* right */
-                case 'D': return 1003; /* left  */
-            }
-        }
+    if (c != '\033') return (int)c;
+
+    /* peek at next byte */
+    unsigned char seq[2];
+    if (read(0, &seq[0], 1) != 1) return '\033';
+    if (seq[0] != '[') return '\033';
+    if (read(0, &seq[1], 1) != 1) return '\033';
+
+    /* arrow keys: ESC [ A/B/C/D */
+    switch (seq[1]) {
+        case 'A': return KEY_UP;
+        case 'B': return KEY_DOWN;
+        case 'C': return KEY_RIGHT;
+        case 'D': return KEY_LEFT;
+    }
+
+    /*
+     * SGR mouse: ESC [ < Pb ; Px ; Py M/m
+     * Scroll up = Pb 64, scroll down = Pb 65.
+     * We read digits until we hit 'M' or 'm', parsing only Pb.
+     */
+    if (seq[1] == '<') {
+        int pb = 0; unsigned char mc;
+        /* read Pb */
+        while (read(0, &mc, 1) == 1 && mc != ';') pb = pb*10 + (mc-'0');
+        /* drain Px ; Py M/m */
+        int done = 0;
+        while (!done && read(0, &mc, 1) == 1)
+            if (mc == 'M' || mc == 'm') done = 1;
+        if (pb == 64) return KEY_SCROLL_UP;
+        if (pb == 65) return KEY_SCROLL_DN;
         return '\033';
     }
-    return (int)c;
+
+    return '\033';
 }
 
 /* ─── main loop ─────────────────────────────────────────────────── */
@@ -397,21 +428,32 @@ static void run(void) {
             save_file();
             break;
 
-        case 1000: /* up */
+        case KEY_UP:
             if (crow > 0) crow--;
             clamp_col();
             break;
-        case 1001: /* down */
+        case KEY_DOWN:
             if (crow < nrows-1) crow++;
             clamp_col();
             break;
-        case 1002: /* right */
+        case KEY_RIGHT:
             if (ccol < (int)strlen(buf[crow])) ccol++;
             else if (crow < nrows-1) { crow++; ccol=0; }
             break;
-        case 1003: /* left */
+        case KEY_LEFT:
             if (ccol > 0) ccol--;
             else if (crow > 0) { crow--; ccol=(int)strlen(buf[crow]); }
+            break;
+
+        case KEY_SCROLL_UP:
+            crow -= 3;
+            if (crow < 0) crow = 0;
+            clamp_col();
+            break;
+        case KEY_SCROLL_DN:
+            crow += 3;
+            if (crow >= nrows) crow = nrows - 1;
+            clamp_col();
             break;
 
         case 1:   /* Ctrl-A — home */
